@@ -54,14 +54,6 @@ class G2pEncoder(nn.Module):
         self.enc_b_ih = torch.tensor(self.variables["enc_b_ih"])  # (3*128,)
         self.enc_b_hh = torch.tensor(self.variables["enc_b_hh"])  # (3*128,)
 
-        self.dec_emb = torch.tensor(self.variables["dec_emb"])  # (74, 64). (len(phonemes), emb)
-        self.dec_w_ih = torch.tensor(self.variables["dec_w_ih"])  # (3*128, 64)
-        self.dec_w_hh = torch.tensor(self.variables["dec_w_hh"])  # (3*128, 128)
-        self.dec_b_ih = torch.tensor(self.variables["dec_b_ih"])  # (3*128,)
-        self.dec_b_hh = torch.tensor(self.variables["dec_b_hh"])  # (3*128,)
-        self.fc_w = torch.tensor(self.variables["fc_w"])  # (74, 128)
-        self.fc_b = torch.tensor(self.variables["fc_b"])  # (74,)
-
     def sigmoid(self, x):
         return torch.sigmoid(x)
 
@@ -90,24 +82,14 @@ class G2pEncoder(nn.Module):
             outputs[:, t, :] = h
         return outputs
 
-    def encode(self, x):
-        x = F.embedding(x, self.enc_emb)
-        return x
-    
-    def encode_and_fs_decode(self, x, len_words):
+    def forward(self, x):
         # encoder
-        enc = self.encode(x).unsqueeze(0)
-        enc = self.gru(enc, len_words + 1, self.enc_w_ih, self.enc_w_hh,
+        x = F.embedding(x, self.enc_emb)
+        enc = x.unsqueeze(0)
+        enc = self.gru(enc, x.shape[0], self.enc_w_ih, self.enc_w_hh,
                        self.enc_b_ih, self.enc_b_hh, h0=torch.zeros((1, self.enc_w_hh.shape[-1]), dtype=torch.float32))
         last_hidden = enc[:, -1, :]
-
-        # decoder
-        dec = F.embedding(torch.tensor([2]), self.dec_emb).unsqueeze(0)  # 2: <s>
-        h = last_hidden
-        return dec, h
-
-    def forward(self, x, len_words):
-        return self.encode_and_fs_decode(x, len_words)
+        return last_hidden
     
 class G2pDecoder(nn.Module):
     def __init__(self):
@@ -145,11 +127,6 @@ class G2pDecoder(nn.Module):
 
     def load_variables(self):
         self.variables = np.load(os.path.join(dirname,'checkpoint20.npz'))
-        self.enc_emb = torch.tensor(self.variables["enc_emb"])  # (29, 64). (len(graphemes), emb)
-        self.enc_w_ih = torch.tensor(self.variables["enc_w_ih"])  # (3*128, 64)
-        self.enc_w_hh = torch.tensor(self.variables["enc_w_hh"])  # (3*128, 128)
-        self.enc_b_ih = torch.tensor(self.variables["enc_b_ih"])  # (3*128,)
-        self.enc_b_hh = torch.tensor(self.variables["enc_b_hh"])  # (3*128,)
 
         self.dec_emb = torch.tensor(self.variables["dec_emb"])  # (74, 64). (len(phonemes), emb)
         self.dec_w_ih = torch.tensor(self.variables["dec_w_ih"])  # (3*128, 64)
@@ -159,15 +136,11 @@ class G2pDecoder(nn.Module):
         self.fc_w = torch.tensor(self.variables["fc_w"])  # (74, 128)
         self.fc_b = torch.tensor(self.variables["fc_b"])  # (74,)
 
-    def decode(self, dec, h):
+    def forward(self, pred, h):
+        dec = F.embedding(pred, self.dec_emb).unsqueeze(0)
         h = self.grucell(dec.squeeze(1), h, self.dec_w_ih, self.dec_w_hh, self.dec_b_ih, self.dec_b_hh)  # (b, h)
         logits = F.linear(h, self.fc_w, self.fc_b)
-        pred = logits.argmax().item()
-        dec = F.embedding(torch.tensor([pred]), self.dec_emb).unsqueeze(0)
-        return pred, dec, h
-
-    def forward(self, dec, h):
-        return self.decode(dec, h)
+        return logits, h
 
 
 class G2p(object):
@@ -205,14 +178,15 @@ class G2p(object):
 
         x = self.tokenize(word)
 
-        dec, h = encoder.encode_and_fs_decode(x, len(word))
-        #print(x.shape)
-        #print(dec.shape)
-        #print(h.shape)
+        h = encoder(x)
 
         preds = []
+        pred = 2    # initial symbol
         for i in range(20):
-            pred, dec, h = decoder.decode(dec, h)
+            pred = torch.tensor([pred])
+            logits, h = decoder(pred, h)
+            pred = logits.argmax().item()
+            print(pred)
             if pred == 3: break  # 3: </s>
             preds.append(pred)
 
@@ -268,15 +242,25 @@ if __name__ == '__main__':
         print(out)
 
         # export
-        #text = "activationist"
-        #encoder = G2pEncoder()
-        #x = g2p.tokenize(text)
-        #len_words = len(text)
-        #print(x)
-        #print(len_words)
-        #torch.onnx.export(encoder,
-        #                (x, len_words),
-        #                "encode_and_fs_decode.onnx",
-        #                input_names=['x', 'len_words'],
-        #                output_names=['dec', 'h'],
-        #                dynamic_axes={'x': {0: 'seq_len'}})
+        onnx_export = True
+        if onnx_export:
+            text = "activationist"
+            encoder = G2pEncoder()
+            x = g2p.tokenize(text)
+            len_words = len(text)
+            torch.onnx.export(encoder,
+                            (x),
+                            "g2p_encoder.onnx",
+                            input_names=['x'],
+                            output_names=['h'],
+                            dynamic_axes={'x': {0: 'seq_len'}})
+
+            h = encoder(x)
+            pred = torch.tensor([2])
+
+            decoder = G2pDecoder()
+            torch.onnx.export(decoder,
+                            (pred, h),
+                            "g2p_decoder.onnx",
+                            input_names=['pred', 'h_in'],
+                            output_names=['logits', 'h_out'])
