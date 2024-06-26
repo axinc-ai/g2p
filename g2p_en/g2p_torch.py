@@ -61,33 +61,30 @@ class G2pEncoder(nn.Module):
         rzn_ih = F.linear(x, w_ih, b_ih)
         rzn_hh = F.linear(h, w_hh, b_hh)
 
-        rz_ih, n_ih = torch.split(rzn_ih, int(rzn_ih.shape[-1] * 2 / 3), dim=-1)
-        rz_hh, n_hh = torch.split(rzn_hh, int(rzn_hh.shape[-1] * 2 / 3), dim=-1)
+        rz_ih, n_ih = torch.split(rzn_ih, 512, dim=-1)
+        rz_hh, n_hh = torch.split(rzn_hh, 512, dim=-1)
 
         rz = self.sigmoid(rz_ih + rz_hh)
-        r, z = torch.split(rz, int(rz.shape[-1] / 2), dim=-1)
+        r, z = torch.split(rz, 256, dim=-1)
 
         n = torch.tanh(n_ih + r * n_hh)
         h = (1 - z) * n + z * h
 
         return h
 
-    def gru(self, x, steps, w_ih, w_hh, b_ih, b_hh, h0=None):
-        if h0 is None:
-            h0 = torch.zeros((x.shape[0], w_hh.shape[1]), dtype=torch.float32)
-        h = h0  # initial hidden state
+    def gru(self, x, steps, w_ih, w_hh, b_ih, b_hh, h):
         outputs = torch.zeros((x.shape[0], steps, w_hh.shape[1]), dtype=torch.float32)
         for t in range(steps):
             h = self.grucell(x[:, t, :], h, w_ih, w_hh, b_ih, b_hh)  # (b, h)
             outputs[:, t, :] = h
         return outputs
 
-    def forward(self, x):
+    def forward(self, x, h):
         # encoder
         x = F.embedding(x, self.enc_emb)
         enc = x.unsqueeze(0)
         enc = self.gru(enc, x.shape[0], self.enc_w_ih, self.enc_w_hh,
-                       self.enc_b_ih, self.enc_b_hh, h0=torch.zeros((1, self.enc_w_hh.shape[-1]), dtype=torch.float32))
+                       self.enc_b_ih, self.enc_b_hh, h)
         last_hidden = enc[:, -1, :]
         return last_hidden
     
@@ -104,11 +101,11 @@ class G2pDecoder(nn.Module):
         rzn_ih = F.linear(x, w_ih, b_ih)
         rzn_hh = F.linear(h, w_hh, b_hh)
 
-        rz_ih, n_ih = torch.split(rzn_ih, int(rzn_ih.shape[-1] * 2 / 3), dim=-1)
-        rz_hh, n_hh = torch.split(rzn_hh, int(rzn_hh.shape[-1] * 2 / 3), dim=-1)
+        rz_ih, n_ih = torch.split(rzn_ih, 512, dim=-1)
+        rz_hh, n_hh = torch.split(rzn_hh, 512, dim=-1)
 
         rz = self.sigmoid(rz_ih + rz_hh)
-        r, z = torch.split(rz, int(rz.shape[-1] / 2), dim=-1)
+        r, z = torch.split(rz, 256, dim=-1)
 
         n = torch.tanh(n_ih + r * n_hh)
         h = (1 - z) * n + z * h
@@ -178,7 +175,9 @@ class G2p(object):
 
         x = self.tokenize(word)
 
-        h = encoder(x)
+        h = torch.zeros((1, 256), dtype=torch.float32)
+        for i in range(x.shape[0]):
+            h = encoder(torch.tensor([x[i]]), h)
 
         preds = []
         pred = 2    # initial symbol
@@ -186,7 +185,6 @@ class G2p(object):
             pred = torch.tensor([pred])
             logits, h = decoder(pred, h)
             pred = logits.argmax().item()
-            print(pred)
             if pred == 3: break  # 3: </s>
             preds.append(pred)
 
@@ -237,7 +235,7 @@ if __name__ == '__main__':
              "I refuse to collect the refuse around here.", # homograph
              "I'm an activationist."] # newly coined word
     g2p = G2p()
-    for text in texts:
+    for text in ["activationist"]:
         out = g2p(text)
         print(out)
 
@@ -247,15 +245,15 @@ if __name__ == '__main__':
             text = "activationist"
             encoder = G2pEncoder()
             x = g2p.tokenize(text)
-            len_words = len(text)
+            x = torch.tensor([x[0]])
+            h = torch.zeros((1, 256), dtype=torch.float32)
             torch.onnx.export(encoder,
-                            (x),
+                            (x, h),
                             "g2p_encoder.onnx",
-                            input_names=['x'],
-                            output_names=['h'],
-                            dynamic_axes={'x': {0: 'seq_len'}})
+                            input_names=['x', 'h_in'],
+                            output_names=['h_out'])
 
-            h = encoder(x)
+            h = encoder(x, h)
             pred = torch.tensor([2])
 
             decoder = G2pDecoder()
